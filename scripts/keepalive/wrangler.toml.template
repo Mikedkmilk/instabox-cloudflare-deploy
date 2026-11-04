@@ -1,0 +1,34 @@
+# Cloudflare Worker 保活 · 配置模板
+#
+# 用法：
+#   1. 复制成 wrangler.toml
+#   2. 把 <MACHINE_ID> 换成机器 ID（m_xxx，不是机器名！）
+#   3. 按需改 cron 间隔
+#
+# ⚠️ wrangler 4 的 cron 必须写在 [triggers] 段下。
+#    写在顶层只打一条 WARNING，cron 根本不生效（部署输出仍会显示你写的值，极易误判）。
+
+name = "instabox-keepalive"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# 每 3 分钟续一次租约。
+# TTL 默认 900 秒（见 worker.js 的 DEFAULT_TTL），远大于间隔，中间不留空窗。
+# 间隔选 3 分钟的理由：撞 8 小时运行上限进入冷却期后，冷却一结束下一次 cron
+# 就能立刻把机器拉起来，网站空窗从 9 分钟压到 3 分钟。
+# 免费套餐限制：每个 Worker 最多 3 个 cron 触发器，最小间隔 1 分钟。
+[triggers]
+crons = ["*/3 * * * *"]
+
+# 机器 ID：activity-leases 端点只认 ID，用机器名会 404 machine not found
+[vars]
+INSTABOX_MACHINE = "<MACHINE_ID>"
+
+# 租约秒数，30–3600，默认 900（可省略）
+# INSTABOX_TTL = "900"
+
+# ⚠️ INSTABOX_API_KEY 和 TOKEN 必须用 `wrangler secret put` 写入，不要放这里
+#    （vars 会在部署输出里明文显示）：
+#      echo "$INSTABOX_API_KEY" | npx wrangler secret put INSTABOX_API_KEY
+#      echo "$TOKEN"            | npx wrangler secret put TOKEN
+#    顺序不能反：secret put 要求 Worker 已存在，必须先 deploy。

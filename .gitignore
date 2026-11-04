@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# 本地凭据与配置（永不入库）
+.env
+.env.*
+*.key
+instabox.key
+worker-token.txt
+oauth-url.txt
+
+# Node
+node_modules/
+.next/
+npm-debug.log*
+
+# 临时暂存
+tmp/
+stage/
+*.log
