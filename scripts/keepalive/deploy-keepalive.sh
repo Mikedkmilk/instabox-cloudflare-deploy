@@ -3,7 +3,10 @@
 #
 # 用法：
 #   export INSTABOX_API_KEY='ibk_...'
-#   bash deploy-keepalive.sh --machine-id m_xxx [--machine web-app] [--worker-name instabox-keepalive] [--cron '*/3 * * * *'] [--ttl 900] [--work-dir ./wrk]
+#   bash deploy-keepalive.sh --machine-id m_xxx [--machine web-app] [--worker-name instabox-keepalive] [--cron '*/3 * * * *'] [--ttl 900] [--exec-cmd '...'] [--work-dir ./wrk]
+#
+# --exec-cmd：每轮跑的健康检查命令，默认体检隧道连接器（worker.js 内置默认值）。
+#              这关系到能否拿到免费档的 max-run 动态延长，见 references/keepalive-worker.md
 set -euo pipefail
 
 MACHINE_ID=""
@@ -11,6 +14,7 @@ MACHINE=""
 WORKER_NAME="instabox-keepalive"
 CRON='*/3 * * * *'
 TTL=900
+EXEC_CMD=""
 WORK_DIR="${TMPDIR:-/tmp}/instabox-keepalive"
 TOKEN=""
 
@@ -21,6 +25,7 @@ while [ $# -gt 0 ]; do
     --worker-name)  WORKER_NAME="$2"; shift 2 ;;
     --cron)         CRON="$2"; shift 2 ;;
     --ttl)          TTL="$2"; shift 2 ;;
+    --exec-cmd)     EXEC_CMD="$2"; shift 2 ;;
     --token)        TOKEN="$2"; shift 2 ;;
     --work-dir)     WORK_DIR="$2"; shift 2 ;;
     *) echo "未知参数: $1" >&2; exit 1 ;;
@@ -54,6 +59,10 @@ crons = ["$CRON"]
 INSTABOX_MACHINE = "$MACHINE_ID"
 INSTABOX_TTL = "$TTL"
 EOF
+# 可选：自定义每轮的健康检查命令（拿 max-run 动态延长用）
+if [ -n "$EXEC_CMD" ]; then
+  printf 'INSTABOX_EXEC_CMD = "%s"\n' "$EXEC_CMD" >> "$WORK_DIR/wrangler.toml"
+fi
 ok "已生成 $WORK_DIR（cron=$CRON, ttl=$TTL）"
 
 # ⚠️ crons 必须在 [triggers] 下 —— 写顶层 wrangler 4 会静默忽略
@@ -68,16 +77,26 @@ ok "已登录"
 # ================================================================ 3. 部署 + Secret
 step "3/4 部署 Worker 并写入 Secret"
 cd "$WORK_DIR"
-# ⚠️ 必须先 deploy：secret put 要求 Worker 已存在
+# ⚠️ 必须先 deploy：secret bulk 要求 Worker 已存在
 npx --yes wrangler@latest deploy || die "Worker 部署失败"
 ok "Worker 已部署"
 
 [ -n "$TOKEN" ] || TOKEN="$(node -e "console.log(require('crypto').randomBytes(16).toString('hex'))")"
 ok "访问口令：$TOKEN"
 
-# ⚠️ 用管道喂值；写空时 wrangler 照样输出 Success，之后必须用 /status 验证
-printf '%s' "$INSTABOX_API_KEY" | npx --yes wrangler@latest secret put INSTABOX_API_KEY || die "写 INSTABOX_API_KEY 失败"
-printf '%s' "$TOKEN"            | npx --yes wrangler@latest secret put TOKEN || die "写 TOKEN 失败"
+# ⚠️ 用 `secret bulk`（JSON 文件）而不是 `secret put` + 管道：
+#    管道在部分 shell / PowerShell 下会在末尾补一个换行，而 wrangler 不会 trim，
+#    于是存进去的 TOKEN 比你手里那个多一个 \n，表现为 Worker 一直回「token 不对」。
+#    另外写空时 wrangler 照样输出 Success，之后必须用 /status 验证。
+node -e '
+  const fs = require("fs");
+  fs.writeFileSync("secrets.json", JSON.stringify({
+    INSTABOX_API_KEY: process.env.INSTABOX_API_KEY,
+    TOKEN: process.argv[1],
+  }));
+' "$TOKEN" || die "生成 secrets.json 失败"
+INSTABOX_API_KEY="$INSTABOX_API_KEY" npx --yes wrangler@latest secret bulk secrets.json || die "写 Secret 失败"
+rm -f secrets.json
 ok "Secret 已写入"
 
 # ================================================================ 4. 验证

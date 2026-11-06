@@ -85,7 +85,7 @@ GitHub 源码  ──►  InstaBox 云主机  ──►  Cloudflare Tunnel  ─�
 - Vercel / Netlify 等静态托管（没有常驻进程，也就不需要本 Skill）
 - Oracle / 自购 VPS 迁移（流程不同，代价模型也不同）
 - 纯 Cloudflare Workers 应用开发（`node:sqlite` 在 Workers 里是空壳）
-- 需要 24 小时零中断的站点 —— 免费额度有 8 小时硬上限，见下文
+- 需要 24 小时零中断的站点 —— 免费额度每轮最多跑 8 小时，见下文
 
 ---
 
@@ -100,12 +100,19 @@ GitHub 源码  ──►  InstaBox 云主机  ──►  Cloudflare Tunnel  ─�
 | `/data` 持久盘 | 20 GiB | **免费档不可 resize** |
 | 系统盘 | 16 GiB | 模板自带 |
 | 空闲挂起 | **固定 1800 秒（30 分钟）** | **改不掉**，`auto-suspend 0` 会被静默忽略 |
-| 连续运行上限 | **固定 480 分钟（8 小时）** | 免费档改不了 |
-| 冷却期 | 5–20 分钟随机 | — |
+| 连续运行上限 | **每轮最多 8 小时**，但每轮从 **2 小时**起步、动态延长 | 上限改不了；**延长靠真实工作量**（见下） |
+| 冷却期 | 5–20 / 60–75 / 120–135 分钟（连续撞逐级变长） | — |
 | 快照 | 5 个 | — |
 
-> **8 小时上限是免费档最硬的边界**：跑满必被强制暂停，随后进入冷却期，期间任何唤醒方式都返回
-> `409 machine_cooldown`。保活只能解决「空闲挂起」，解决不了它。要彻底消除中断只能升 Pro。
+> **运行上限是免费档最硬的边界**：每轮最多 8 小时，跑满必被强制暂停，随后进入冷却期，
+> 期间任何唤醒方式都返回 `409 machine_cooldown`。要彻底消除中断只能升 Pro。
+>
+> 但上限**每轮从 2 小时起步**——deadline 前 5 分钟，平台按**前 30 分钟的真实工作量**决定是否延长：
+> ≥5 个不同的工作分钟 → 延长 2 小时，1–4 个 → 延长 30 分钟，0 个 → 到点暂停。
+> **计入工作量的**：exec、文件请求、app 请求、终端/SSH 流量、访客活动。
+> **不计入工作量的：续租 keepalive lease、请求唤醒。**
+> 所以保活 Worker 除了续租，**每轮还必须真跑一次 exec**——否则拿不到延长，机器会频繁撞上限。
+> 详见 `references/keepalive-worker.md`。
 
 ### 机器内环境（实测）
 
@@ -149,6 +156,7 @@ GitHub 源码  ──►  InstaBox 云主机  ──►  Cloudflare Tunnel  ─�
 | `WORKER_NAME` | — | 保活 Worker 名，默认 `instabox-keepalive` |
 | `KEEPALIVE_CRON` | — | cron 表达式，默认 `*/3 * * * *`。**间隔必须小于 TTL** |
 | `KEEPALIVE_TTL` | — | 租约秒数，范围 30–3600，默认 `900` |
+| `KEEPALIVE_EXEC_CMD` | — | 每轮跑的健康检查命令，留空 = 内置默认（体检隧道连接器）。**关系到能否拿到 max-run 动态延长** |
 | `WORKER_TOKEN` | — | Worker 访问口令。**不设则任何人知道域名就能触发续租**。生成：`node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"` |
 
 ### 脚本参数
@@ -234,6 +242,7 @@ pwsh -File scripts/keepalive/deploy-keepalive.ps1 -Machine <机器名> -MachineI
 | `-WorkerName` | `instabox-keepalive` | Worker 名 |
 | `-Cron` | `*/3 * * * *` | cron 表达式 |
 | `-Ttl` | `900` | 租约秒数，**必须 > cron 间隔** |
+| `-ExecCmd` | `''` | 每轮跑的健康检查命令，默认体检隧道连接器。**关系到能否拿到 max-run 动态延长** |
 | `-Token` | `''` | Worker 访问口令，不给则自动生成并打印 |
 | `-WorkDir` | `$env:TEMP\instabox-keepalive` | 工作目录 |
 | `-ApiKey` | `''` | 不给则读环境变量 |
@@ -241,7 +250,7 @@ pwsh -File scripts/keepalive/deploy-keepalive.ps1 -Machine <机器名> -MachineI
 #### `scripts/keepalive/deploy-keepalive.sh` — 部署保活 Worker（Linux/macOS）
 
 ```bash
-bash scripts/keepalive/deploy-keepalive.sh --machine-id m_xxx [--machine <名>] [--worker-name instabox-keepalive] [--cron '*/3 * * * *'] [--ttl 900] [--token <口令>] [--work-dir ./wrk]
+bash scripts/keepalive/deploy-keepalive.sh --machine-id m_xxx [--machine <名>] [--worker-name instabox-keepalive] [--cron '*/3 * * * *'] [--ttl 900] [--exec-cmd '<命令>'] [--token <口令>] [--work-dir ./wrk]
 ```
 
 #### `scripts/verify-site.ps1` — 端到端验收
@@ -274,11 +283,14 @@ Worker `/status` 返回 running、Worker cron 有触发日志。
 | `TOKEN` | Secret | Worker 访问口令 |
 | `INSTABOX_MACHINE` | Text | 机器 ID（`m_xxx`），留空 = 该 key 名下全部机器 |
 | `INSTABOX_TTL` | env | 租约秒数，30–3600，默认 900 |
+| `INSTABOX_EXEC_CMD` | env | 每轮跑的健康检查命令，默认 `systemctl is-active cloudflared`。**这关系到能否拿到 max-run 动态延长**，见 `references/keepalive-worker.md` |
 | `crons` | `[triggers]` 下 | `*/3 * * * *` |
 
 > ⚠️ **wrangler 4 的 cron 必须写在 `[triggers]` 段下面**，写顶层会被静默忽略，只打一条 WARNING，
 > cron 根本不生效，但 `wrangler deploy` 照样成功。
-> ⚠️ **`secret put` 必须在 `deploy` 之后**——`secret put` 要求 Worker 已存在，顺序反了会报「worker 不存在」。
+> ⚠️ **写 Secret 必须在 `deploy` 之后**——`secret bulk` 要求 Worker 已存在，顺序反了会报「worker 不存在」。
+> ⚠️ **别用 `echo "$TOKEN" | wrangler secret put TOKEN`**：管道会补一个尾换行而 wrangler 不 trim，
+> 存进去的 TOKEN 多一个 `\n`，表现为 Worker 永远回「token 不对」。用 `wrangler secret bulk`（JSON 文件）。
 
 ---
 
@@ -334,8 +346,10 @@ pwsh -File scripts/keepalive/deploy-keepalive.ps1 -Machine <机器名> -MachineI
 
 要点：
 - lease 端点**只认机器 ID**，用机器名 404
-- cron 间隔 540s < TTL 900s，中间不留空窗；免费版最多 3 个触发器
+- cron 间隔 180s < TTL 900s，中间不留空窗；免费版最多 3 个触发器
 - **wrangler 4 的 cron 必须写在 `[triggers]` 下**
+- Worker 每轮除续租外还**跑一次真实 exec**——免费档运行上限是动态的（每轮 2 小时起步，
+  按前 30 分钟真实工作量延长，续租/唤醒都不算工作），不跑 exec 就拿不到延长，机器会频繁撞上限
 - 迁移时把本机计划任务**禁用**（而非删除），保持单一保活源，随时可回滚
 
 ### Step 4 — 端到端验证
@@ -378,9 +392,10 @@ Worker 由 Cloudflare 托管，永不下线。
 不需要。免费额度 4C8G + 20 GiB 持久盘，0 元、免备案。
 
 **Q：网站能 24 小时不断吗？**
-免费额度有 **8 小时强制暂停** + 5–20 分钟冷却期的硬限制。保活解决不了这个。
-Worker 能让冷却结束后下一跳就把机器拉回来，把空窗压到 3 分钟左右；
-要彻底消除中断只能升 Pro（$20/月）。
+免费额度**每轮最多跑 8 小时**，撞上限强制暂停后进入冷却期（连续撞会逐级变长：5–20 → 60–75 → 120–135 分钟）。
+保活 Worker 能在冷却结束后下一跳（≤3 分钟）把机器拉回来，但**冷却期本身无法绕过**。
+Worker 每轮除了续租还跑一次真实 exec，把每轮从 2 小时延到 8 小时上限，**大幅减少撞上限的次数**。
+要彻底消除中断只能升 Pro（$20/月，maxRun 默认不限）。
 
 **Q：为什么不用自购 VPS？**
 主要是省事：不用备案、不用管证书（Cloudflare 边缘证书）、不用配 Nginx，
@@ -434,7 +449,9 @@ Cloudflare 免费版没有中国内地节点。要快只能换国内服务器并
 | `database disk image is malformed` | WAL 模式下只传了主库，与 `-wal` 失配 | 传前 `PRAGMA wal_checkpoint(TRUNCATE)` |
 | 公网 502 + `tls: first record...` | Public Hostname 的 Service Type 选了 HTTPS | 改成 **HTTP** |
 | lease 续租 404 `machine not found` | 端点只认机器 ID | 用 `m_xxx` |
-| lease 续租 409 `machine_cooldown` | 撞 8 小时上限的冷却期 | 读 `retryAfterSeconds`，本轮跳过，**别硬撞** |
+| lease 续租 409 `machine_cooldown` | 撞运行上限的冷却期 | 读 `retryAfterSeconds`，本轮跳过，**别硬撞** |
+| Worker 一直回 `token 不对` | secret 写入时尾部多了一个换行（管道喂值 + wrangler 不 trim） | 改用 `wrangler secret bulk`（见 `scripts/keepalive/deploy-keepalive.ps1`） |
+| 机器频繁撞运行上限、`maxRunMinutes` 一直是 120 | 保活只续租没跑 exec，拿不到动态延长 | 确认 Worker 版本含 `realWork`，或设 `INSTABOX_EXEC_CMD` |
 | Worker deploy 显示 cron 但不触发 | cron 写在了顶层 | 移到 `[triggers]` 下 |
 | `secret put` 报 worker 不存在 | 顺序反了 | 先 `deploy` 再 `secret put` |
 | 构建后全站 500 / 裸文本 | `dev` 与 `start` 共用 `.next` 损坏 | 停服 → `rm -rf .next` → 重新 build |
@@ -513,11 +530,12 @@ instabox-cloudflare-deploy/
 │   ├── setup-tunnel.sh                机器端装 Cloudflare Tunnel 连接器
 │   ├── verify-site.ps1                Step 4 端到端验收
 │   ├── keepalive/
-│   │   ├── worker.js                  通用化保活 Worker（TTL 可配、Idempotency-Key 已修）
+│   │   ├── worker.js                  通用化保活 Worker（TTL 可配、Idempotency-Key 已修、
+│   │   │                              每轮跑真实 exec 以拿到 max-run 动态延长）
 │   │   ├── wrangler.toml.template     Worker 配置模板（cron 必须在 [triggers] 下）
-│   │   ├── deploy-keepalive.ps1       保活部署（Windows）
+│   │   ├── deploy-keepalive.ps1       保活部署（Windows，secret 用 bulk 写）
 │   │   └── deploy-keepalive.sh        保活部署（Linux/macOS）
-│   └── test_skill_assets.py           坑位回归自测（28 项）
+│   └── test_skill_assets.py           坑位回归自测（32 项）
 └── dist/
     └── instabox-cloudflare-deploy.skill   打包产物
 ```

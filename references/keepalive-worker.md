@@ -31,11 +31,73 @@ InstaBox 免费套餐唯一能用的保活是 **activity lease**（见 `instabox
 
 | 参数 | 值 | 理由 |
 |---|---|---|
-| cron 间隔 | `*/3 * * * *`（180s） | 撞 8 小时上限后，冷却一结束下一次 cron 就能拉起，网站空窗从 9 分钟压到 3 分钟 |
+| cron 间隔 | `*/3 * * * *`（180s） | ① 撞上限进入冷却期后，冷却一结束下一次 cron 就能拉起，网站空窗从 9 分钟压到 3 分钟；② 每 3 分钟一次 exec，任意 30 分钟窗口内就有 10 个不同的工作分钟，满足 max-run 动态延长的「≥5 个」条件 |
 | lease TTL | 900s | 必须 > 间隔（180s），否则两次之间出现空窗 |
 | lease 名 | `keepalive` | 固定名字，重复续租即覆盖 |
+| exec 命令 | 默认 `systemctl is-active cloudflared` | **拿 max-run 延长的关键**，见下一节 |
 
-免费版若要更短间隔，最低 1 分钟；再短没有意义——冷却期本身是 5–20 分钟。
+免费版若要更短间隔，最低 1 分钟；再短没有意义——冷却期本身是 5–20 分钟起。
+
+---
+
+## 关键机制：max-run 的动态延长（只续租是拿不到的）
+
+这是免费档保活里最容易漏掉的一环，**必须理解，否则保活等于白做**。
+
+官方文档《Machines → Auto-pause and max-run》：
+
+- 免费档每一轮 run 从 **2 小时窗口**起步。`instabox get` 报的 `maxRunMinutes` 就是这个**当前上限**，
+  所以它会在 120 / 240 / 480 之间跳变——**这是正常的动态行为，不是配置漂移**。
+- **deadline 前 5 分钟**，服务端检查**前 30 个完整分钟**里的「真实工作量」：
+
+  | 不同的工作分钟数 | 当前 deadline 的变化 |
+  |---|---|
+  | ≥ 5 | **延长 2 小时** |
+  | 1 – 4 | 延长 30 分钟 |
+  | 0 | 到点直接暂停 |
+
+- 计入工作量的：**exec、文件请求、app 请求、终端/SSH 流量、访客活动**。
+- **不计入工作量的：续租 keepalive lease、请求唤醒**（官方原文：
+  *Renewing a keepalive lease or requesting a wake does not earn an extension.*）
+- 活动采集不可用时，本轮退化为「从启动起算的 8 小时限制」——这就是偶尔看到 `maxRunMinutes = 480` 的原因。
+- 无论怎么延长，**每轮最多 8 小时**。
+
+### 为什么这件事很要命
+
+| 只续租 | 续租 + 每轮 exec（本方案） |
+|---|---|
+| 只能挡住「空闲 30 分钟挂起」 | 两样都挡 |
+| max-run 到点照样暂停 | 每次延长 2 小时，撑到 8 小时上限 |
+| 连续撞冷却期 5–20 → 60–75 → **120–135 分钟** | 基本不撞 |
+
+免费档连续撞 max-run 的冷却期**逐级变长**（官方《Auto-pause and max-run》原文）：
+
+| 连续第几次撞上限 | 冷却期 |
+|---|---|
+| 第 1 次 | 5 – 20 分钟 |
+| 第 2 次 | 60 – 75 分钟 |
+| 第 3 次起 | 120 – 135 分钟 |
+
+也就是说，只续租不但拿不到延长，还可能因为反复撞上限把中断越拖越长。
+
+### 本方案怎么做的
+
+Worker 每轮做两件事：
+
+1. `PUT /v1/machines/{id}/activity-leases/keepalive`（TTL 900s）—— 挡空闲挂起
+2. `POST /v1/machines/{id}/exec` —— **记工作分**，顺带体检关键服务
+
+默认 exec 命令是 `systemctl is-active cloudflared`（隧道连接器，见 `scripts/setup-tunnel.sh`）。
+换成自己的健康检查也行：
+
+```toml
+[vars]
+INSTABOX_EXEC_CMD = "curl -fsS -o /dev/null http://127.0.0.1:3000/ ; true"
+```
+
+> ⚠️ `maxRunMinutes` 本身**改不了**：`instabox max-run <box> 480` 或 `-1` 都会返回
+> `permission_denied: free machines have a managed maxRunMinutes; only an admin session can override it`。
+> 能动的只有「让它每一轮都能延到 8 小时」这一件事——那就是 exec。
 
 ---
 
@@ -76,14 +138,19 @@ npx --yes wrangler@latest deploy          # 先建出 Worker
 ### 3. 写两个 Secret（**必须在 deploy 之后**）
 
 ```bash
-# InstaBox API Key
-echo "$INSTABOX_API_KEY" | npx --yes wrangler@latest secret put INSTABOX_API_KEY
-
-# Worker 访问口令（不设则任何人知道域名就能触发续租）
-echo "$TOKEN" | npx --yes wrangler@latest secret put TOKEN
+# 用 secret bulk（JSON 文件）一次写完
+node -e 'require("fs").writeFileSync("secrets.json", JSON.stringify({
+  INSTABOX_API_KEY: process.env.INSTABOX_API_KEY, TOKEN: process.argv[1] }))' "$TOKEN"
+npx --yes wrangler@latest secret bulk secrets.json && rm -f secrets.json
 ```
 
-> ⚠️ **顺序不能反**：`secret put` 要求 Worker 已存在，否则报错。
+> ⚠️ **顺序不能反**：`secret bulk` 要求 Worker 已存在，否则报错。
+>
+> ⚠️ **不要用 `echo "$TOKEN" | wrangler secret put TOKEN`**：管道在部分 shell / PowerShell 下
+> 会在末尾补一个换行，而 wrangler **不 trim**，存进去的 TOKEN 比你手里那个多一个 `\n`，
+> 表现是 Worker 永远回 `{"ok":false,"error":"token 不对"}`——实测踩过。
+> `scripts/keepalive/deploy-keepalive.ps1` 与 `deploy-keepalive.sh` 都改用 `secret bulk`。
+>
 > ⚠️ **管道喂空值不会报错**：如果 `type` 路径写错，`wrangler secret put` 照样输出
 > "Success!" 但实际存的是空串。写完**务必用 `/status` 验证**，别信那句 Success。
 
@@ -123,13 +190,17 @@ curl "https://<worker>.<subdomain>.workers.dev/?token=$TOKEN"
   "ok": true,
   "at": "2026-11-01T19:39:26.572Z",
   "count": 1,
+  "ttl": 900,
   "results": [{
     "ok": true,
     "machine": "web-app",
-    "detail": "续租成功，到期 2026-11-01T19:54:26.577Z"
+    "detail": "续租成功，到期 2026-11-01T19:54:26.577Z；exec ok（active）"
   }]
 }
 ```
+
+> `detail` 里后半段的 `exec ok（…）` 就是「记工作分」那一步的凭据。
+> 少了它说明 Worker 版本旧了，拿不到 max-run 延长（见上文「关键机制」）。
 
 ### cron 真的在触发（**最关键的一步**）
 
@@ -142,7 +213,7 @@ npx --yes wrangler@latest tail instabox-keepalive --format pretty
 ```
 "*/3 * * * *" @ 2026年11月2日 上午3:39:25 - Ok
   (log) instabox-keepalive: {"ok":true,"at":"2026-11-01T19:39:26.572Z","count":1,
-   "results":[{"ok":true,"machine":"web-app","detail":"续租成功，到期 ..."}]}
+   "results":[{"ok":true,"machine":"web-app","detail":"续租成功，到期 ...；exec ok（active）"}]}
 ```
 
 **没看到这条日志 = cron 没生效**，回查 `[triggers]` 写法。
@@ -164,12 +235,26 @@ npx --yes wrangler@latest tail instabox-keepalive --format pretty
 
 | API 返回 | Worker 的处理 |
 |---|---|
-| 续租成功 | 直接返回 `ok: true` |
-| `machine_not_running` | 先 `resume`（失败用 `start` 兜底），轮询等到 `running`，再重试续租 |
+| 续租成功 | 再跑一次 exec（记工作分 + 体检服务），一并返回 `ok: true` |
+| `machine_not_running` | 先 `resume`（失败用 `start` 兜底，带 Idempotency-Key），轮询等到 `running`，再重试续租，然后 exec |
 | `machine_cooldown` | 读 `retryAfterSeconds`，**本轮跳过**，不算硬失败（那是被动的等待，硬撞会被拒） |
 | 其他错误 | 记为失败，日志里留 HTTP 状态和错误码 |
 
 冷却期跳过后，Worker 的 cron 会在下一个周期（≤3 分钟）再试。
+
+### 怎么确认「延长」真的生效了
+
+```bash
+instabox get <机器名> --json | grep -E 'maxRunMinutes|runStartedAt'
+```
+
+- `maxRunMinutes` = 120 → 当前窗口还是初始的 2 小时，延长尚未判定
+- `maxRunMinutes` = 240 / 480 → 平台已经判定「工作分钟 ≥5」并延长了 ✅
+- 判定的时机是 **deadline 前 5 分钟**，所以要在一轮跑满前 5 分钟去看，别刚起跑就查
+
+> `runStartedAt` + `maxRunMinutes` 算得出本轮 deadline。
+> ⚠️ 用 `Invoke-RestMethod` 解析这个 JSON 时 PowerShell 会把 ISO 时间自动转成 DateTime，
+> 再做二次解析会得到错误的月份。**要精确计算就用 `curl` 取原始文本 + `DateTimeOffset::Parse`。**
 
 ---
 

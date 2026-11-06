@@ -14,8 +14,11 @@ compatibility_date = "2026-10-01"
 
 # 每 3 分钟续一次租约。
 # TTL 默认 900 秒（见 worker.js 的 DEFAULT_TTL），远大于间隔，中间不留空窗。
-# 间隔选 3 分钟的理由：撞 8 小时运行上限进入冷却期后，冷却一结束下一次 cron
-# 就能立刻把机器拉起来，网站空窗从 9 分钟压到 3 分钟。
+# 间隔选 3 分钟有两个理由：
+#   1) 撞运行上限进入冷却期后，冷却一结束下一次 cron 就能立刻把机器拉起来，
+#      网站空窗从 9 分钟压到 3 分钟；
+#   2) 每 3 分钟一次 exec，任意 30 分钟窗口内就有 10 个不同的工作分钟，
+#      满足免费档 max-run 动态延长的「≥5 个工作分钟」条件 → 每次延长 2 小时。
 # 免费套餐限制：每个 Worker 最多 3 个 cron 触发器，最小间隔 1 分钟。
 [triggers]
 crons = ["*/3 * * * *"]
@@ -27,8 +30,21 @@ INSTABOX_MACHINE = "<MACHINE_ID>"
 # 租约秒数，30–3600，默认 900（可省略）
 # INSTABOX_TTL = "900"
 
-# ⚠️ INSTABOX_API_KEY 和 TOKEN 必须用 `wrangler secret put` 写入，不要放这里
+# 每轮跑的健康检查命令（可省略，默认体检隧道连接器 cloudflared）。
+# ⚠️ 这一项不是装饰：免费档的 max-run 动态延长只认「真实工作」
+#    （exec / 文件请求 / 终端流量 / 访客活动），
+#    **续租 lease 和请求唤醒都不算工作**。不跑 exec 就拿不到延长，
+#    机器照样会在当前窗口结束时被 max-run 暂停，且连续撞的冷却期会
+#    5–20 → 60–75 → 120–135 分钟逐级变长。
+# 想换成自己的检查（比如应用端口）：
+# INSTABOX_EXEC_CMD = "curl -fsS -o /dev/null http://127.0.0.1:3000/ ; true"
+
+# ⚠️ INSTABOX_API_KEY 和 TOKEN 必须用 `wrangler secret bulk` 写入，不要放这里
 #    （vars 会在部署输出里明文显示）：
-#      echo "$INSTABOX_API_KEY" | npx wrangler secret put INSTABOX_API_KEY
-#      echo "$TOKEN"            | npx wrangler secret put TOKEN
-#    顺序不能反：secret put 要求 Worker 已存在，必须先 deploy。
+#      node -e 'require("fs").writeFileSync("secrets.json", JSON.stringify({
+#        INSTABOX_API_KEY: process.env.INSTABOX_API_KEY, TOKEN: process.argv[1] }))' "$TOKEN"
+#      npx wrangler secret bulk secrets.json && rm -f secrets.json
+#    ⚠️ 不要用 `echo "$TOKEN" | wrangler secret put TOKEN`：管道在部分 shell /
+#       PowerShell 下会补一个尾换行，而 wrangler 不 trim，存进去的 TOKEN 会多一个
+#       \n，表现为 Worker 一直回「token 不对」。实测踩过。
+#    顺序不能反：secret bulk 要求 Worker 已存在，必须先 deploy。

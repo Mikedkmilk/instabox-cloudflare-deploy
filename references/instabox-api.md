@@ -7,7 +7,8 @@ Base URL：`https://api.instabox.sh`
 
 ## 免费套餐的三条硬限制
 
-这三条决定了整个流程的设计，任何 workaround 都绕不过去。
+这三条决定了整个流程的设计。第 1、3 条任何 workaround 都绕不过去；
+第 2 条的上限本身绕不过去，但**每一轮能跑多久可以通过真实工作量延长**（见第 2 条）。
 
 ### 1. 空闲挂起固定 1800 秒 —— 改不了
 
@@ -31,15 +32,42 @@ curl -X PATCH https://api.instabox.sh/v1/machines/<id> \
 
 **唯一可用口子：activity lease**。见 `keepalive-worker.md`。
 
-### 2. 连续运行上限固定 480 分钟（8 小时）
+### 2. 连续运行上限：每轮最多 8 小时，但**改不了、只能靠工作量延长**
 
-撞上限 → 机器被强制暂停 → 进入 **5–20 分钟冷却期**（随机）。
+这一条以前被写成「固定 480 分钟」，**是错的**。官方文档《Machines → Auto-pause and max-run》：
+
+- 免费档每一轮 run 从 **2 小时窗口**起步。`instabox get` 报的 `maxRunMinutes` 就是这个**当前上限**，
+  所以它会在 120 / 240 / 480 之间跳变——**动态行为，不是固定值**。
+- **deadline 前 5 分钟**，服务端检查**前 30 个完整分钟**里的「真实工作量」：
+
+  | 不同的工作分钟数 | 当前 deadline 的变化 |
+  |---|---|
+  | ≥ 5 | **延长 2 小时** |
+  | 1 – 4 | 延长 30 分钟 |
+  | 0 | 到点直接暂停 |
+
+- 计入工作量的：**exec、文件请求、app 请求、终端/SSH 流量、访客活动**。
+- **不计入工作量的：续租 keepalive lease、请求唤醒。**
+- 活动采集不可用时退化为「从启动起算的 8 小时限制」。
+- **无论怎么延长，每轮最多 8 小时。**
+
+`maxRunMinutes` 本身改不了（`instabox max-run <box> 480` / `-1` 都返回
+`permission_denied: free machines have a managed maxRunMinutes; only an admin session can override it`），
+能动的只有「让每轮都能延到 8 小时」——办法就是让 Worker 每轮真跑一次 exec。见 `keepalive-worker.md`。
+
+撞上限 → 机器被强制暂停 → 进入冷却期。免费档冷却期**逐级变长**：
+
+| 连续第几次撞上限 | 冷却期 |
+|---|---|
+| 第 1 次 | 5 – 20 分钟 |
+| 第 2 次 | 60 – 75 分钟 |
+| 第 3 次起 | 120 – 135 分钟 |
 
 冷却期任何唤醒方式全部返回 `409 machine_cooldown`，带 `retryAfterSeconds`：
 `exec` / `SSH` / 文件读 / 公开端口 / `wake` / `resume` / `start` 全部被拒。
 
-**保活只能解决空闲挂起，解决不了 8 小时上限。**
-彻底解决 → 升 InstaBox Pro（$20/月，可自设空闲时间含关闭、可设 maxRun）。
+**保活（续租 + exec）能把每轮从 2 小时拉到 8 小时，但冷却期本身消不掉。**
+彻底消除中断 → 升 InstaBox Pro（$20/月，可自设空闲时间含关闭、maxRun 默认 `-1`）。
 
 ### 3. `/data` 固定 20 GiB，不可 resize
 
@@ -69,7 +97,7 @@ curl -s "https://api.instabox.sh/v1/machines/m_xxx"      -H "X-API-Key: $KEY"
   "state": "running",
   "desiredState": "running",
   "autoSuspendAfterSeconds": 1800,
-  "maxRunMinutes": 480,
+  "maxRunMinutes": 240,
   "runStartedAt": "2026-11-01T16:01:54.206873Z",
   "cooldownUntil": null,
   "storage": { "sizeGiB": 20, "mountPath": "/data", "persistent": true },
@@ -78,7 +106,9 @@ curl -s "https://api.instabox.sh/v1/machines/m_xxx"      -H "X-API-Key: $KEY"
 }
 ```
 
-> `runStartedAt` + `maxRunMinutes` 算得出下次撞 8 小时上限的时点。
+> `runStartedAt` + `maxRunMinutes` 算得出本轮 deadline。
+> `maxRunMinutes` 是**动态值**（120 / 240 / 480 随平台上一轮判定的「工作分钟数」变化），
+> 见上面第 2 条。
 > ⚠️ 用 `Invoke-RestMethod` 解析这个 JSON 时 PowerShell 会把 ISO 时间自动转成 DateTime，
 > 再做二次解析会得到错误的月份。**要精确计算就用 `curl` 取原始文本 + `DateTimeOffset::Parse`。**
 

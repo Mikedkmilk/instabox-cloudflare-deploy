@@ -9,6 +9,8 @@
 #   -WorkerName    Worker 名，默认 instabox-keepalive
 #   -Cron          cron 表达式，默认 */3 * * * *（每 3 分钟）
 #   -Ttl           租约秒数，默认 900（必须 > cron 间隔）
+#   -ExecCmd       每轮跑的健康检查命令，默认体检隧道连接器（worker.js 内置默认值）。
+#                  这关系到能否拿到免费档的 max-run 动态延长，见 references/keepalive-worker.md
 #   -Token         Worker 访问口令；不给则自动生成并打印
 #   -WorkDir       工作目录，默认 $env:TEMP\instabox-keepalive
 param(
@@ -17,6 +19,7 @@ param(
     [string]$WorkerName = 'instabox-keepalive',
     [string]$Cron = '*/3 * * * *',
     [int]$Ttl = 900,
+    [string]$ExecCmd = '',
     [string]$Token = '',
     [string]$WorkDir = '',
     [string]$ApiKey = ''
@@ -58,6 +61,10 @@ crons = ["$Cron"]
 INSTABOX_MACHINE = "$MachineId"
 INSTABOX_TTL = "$Ttl"
 "@
+# 可选：自定义每轮的健康检查命令（拿 max-run 动态延长用）
+if ($ExecCmd) {
+    $toml += "INSTABOX_EXEC_CMD = `"$ExecCmd`"`n"
+}
 Set-Content -LiteralPath (Join-Path $WorkDir 'wrangler.toml') -Value $toml -Encoding UTF8
 Ok "wrangler.toml 已生成（cron=$Cron, ttl=$Ttl）"
 
@@ -78,7 +85,7 @@ if ($who -match '([0-9a-f]{32})') { Ok "Account ID = $($Matches[1])" }
 # ================================================================ 3. 部署 + Secret
 Step "3/4 部署 Worker 并写入 Secret"
 
-# ⚠️ 必须先 deploy：secret put 要求 Worker 已存在
+# ⚠️ 必须先 deploy：secret bulk 要求 Worker 已存在
 Push-Location $WorkDir
 try {
     & npx --yes wrangler@latest deploy 2>&1 | Out-String -Width 200 | Write-Host
@@ -93,16 +100,22 @@ if (-not $Token) {
     Write-Host "   ⚠ 这是访问凭据，保存好；之后 curl 都要带 ?token=$Token" -ForegroundColor Yellow
 }
 
-Write-Host "   写入 INSTABOX_API_KEY …"
+Write-Host "   写入 INSTABOX_API_KEY / TOKEN …"
 Push-Location $WorkDir
 try {
-    # ⚠️ 用管道喂值。若路径/变量写错，wrangler 照样输出 Success 但存的是空值 —— 后面必须验证
-    $env:INSTABOX_API_KEY | & npx --yes wrangler@latest secret put INSTABOX_API_KEY 2>&1 | Out-String | Write-Host
-    if ($LASTEXITCODE -ne 0) { Die "写入 INSTABOX_API_KEY 失败" }
-
-    Write-Host "   写入 TOKEN …"
-    $Token | & npx --yes wrangler@latest secret put TOKEN 2>&1 | Out-String | Write-Host
-    if ($LASTEXITCODE -ne 0) { Die "写入 TOKEN 失败" }
+    # ⚠️ 必须用 `secret bulk`（JSON 文件），不能 `secret put` + 管道：
+    #    PowerShell 往原生进程的 stdin 写字符串时会补一个换行，
+    #    而 wrangler 不会 trim，于是存进去的 TOKEN 比你手里那个多一个 \n，
+    #    表现为 Worker 一直回「token 不对」——踩过，别改回管道。
+    $secretsJson = @{
+        INSTABOX_API_KEY = $env:INSTABOX_API_KEY
+        TOKEN            = $Token
+    } | ConvertTo-Json -Compress
+    $secretsFile = Join-Path $WorkDir 'secrets.json'
+    [System.IO.File]::WriteAllText($secretsFile, $secretsJson, (New-Object System.Text.UTF8Encoding($false)))
+    & npx --yes wrangler@latest secret bulk $secretsFile 2>&1 | Out-String | Write-Host
+    if ($LASTEXITCODE -ne 0) { Die "写入 Secret 失败" }
+    Remove-Item -LiteralPath $secretsFile -Force -ErrorAction SilentlyContinue
 } finally { Pop-Location }
 Ok "Secret 已写入"
 

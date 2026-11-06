@@ -97,8 +97,13 @@ pwsh -File scripts/keepalive/deploy-keepalive.ps1 -Machine <机器名> -MachineI
 
 要点（详见 `references/keepalive-worker.md`）：
 - lease 端点**只认机器 ID**，用机器名 404
-- cron 间隔 540s < TTL 900s，中间不留空窗；免费版最多 3 个触发器
+- cron 间隔 180s < TTL 900s，中间不留空窗；免费版最多 3 个触发器
 - **wrangler 4 的 cron 必须写在 `[triggers]` 下**，写顶层会被静默忽略
+- Worker 除续租外**每轮还要跑一次真实 exec**：免费档运行上限是动态的（每轮 2 小时起步，
+  按前 30 分钟真实工作量延长，**续租与唤醒都不算工作**），不跑 exec 就拿不到延长，
+  机器会频繁撞上限，且冷却期逐级变长（5–20 → 60–75 → 120–135 分钟）
+- 写 Secret 用 `wrangler secret bulk`（JSON 文件），**别用管道喂 `secret put`**——
+  管道补的尾换行会让 Worker 永远回「token 不对」
 
 ### Step 4 — 端到端验证
 
@@ -116,7 +121,7 @@ Worker `/status` 返回 running、Worker cron 有触发日志。
 |---|---|
 | 服务是明文 HTTP（`next start`） | Tunnel Service Type = HTTP |
 | 服务自己带 TLS（Nginx/certbot） | Service Type = HTTPS，URL 填 `https://127.0.0.1:<端口>` |
-| 机器 8 小时上限撞顶、需彻底消除中断 | 保活解决不了，升 InstaBox Pro 或换不限时服务器 |
+| 机器撞运行上限、需彻底消除中断 | 保活能把每轮从 2 小时延到 8 小时上限，但冷却期消不掉 → 升 InstaBox Pro 或换不限时服务器 |
 | 免费额度不够（要 >3 个 cron 或更高 CPU） | 免费版有硬限制，别硬撞 |
 | 私有库拉取失败 | 改用 Release 附件分发数据，或配 PAT |
 

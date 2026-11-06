@@ -137,6 +137,36 @@ class TestKeepaliveWorker(unittest.TestCase):
         ttl = int(match.group(1))
         self.assertTrue(30 <= ttl <= 3600, f"TTL {ttl} outside the API range 30-3600")
 
+    def test_worker_runs_real_exec_for_max_run_extension(self) -> None:
+        """坑：续租 lease 与请求唤醒都**不算**「工作」，拿不到免费档的 max-run 动态延长。
+
+        官方文档《Auto-pause and max-run》：每轮 run 从 2 小时窗口起步，deadline 前 5 分钟
+        按前 30 分钟的「真实工作量」决定是否延长（≥5 个工作分钟 → 延长 2 小时）。
+        计入工作量的只有 exec、文件请求、app 请求、终端/SSH 流量、访客活动。
+        只续租 → 机器照样被 max-run 暂停，且冷却期逐级变长。
+        """
+        worker = read("scripts/keepalive/worker.js")
+        self.assertIn("/exec", worker, "worker must run a real exec to earn max-run extensions")
+        self.assertIn("realWork", worker, "worker must have a realWork step")
+
+    def test_exec_command_is_configurable(self) -> None:
+        """健康检查命令应可通过 env 覆盖，不必改代码。"""
+        worker = read("scripts/keepalive/worker.js")
+        self.assertIn("INSTABOX_EXEC_CMD", worker)
+
+    def test_max_run_dynamic_extension_documented(self) -> None:
+        """坑：maxRunMinutes 是动态值（每轮 2 小时起步），不是固定 480 分钟。"""
+        doc = read("references/keepalive-worker.md")
+        self.assertIn("max-run", doc)
+        self.assertIn("工作分钟", doc)
+        self.assertIn("延长 2 小时", doc)
+
+    def test_secret_bulk_documented(self) -> None:
+        """坑：管道喂 secret 会带尾换行，wrangler 不 trim → Worker 永远回「token 不对」。"""
+        for rel in ("references/keepalive-worker.md", "scripts/keepalive/wrangler.toml.template"):
+            content = read(rel)
+            self.assertIn("secret bulk", content, f"{rel} must recommend `secret bulk`")
+
 
 class TestDeployScripts(unittest.TestCase):
     """坑：build 与 next start 并发会损坏 .next。"""
@@ -169,7 +199,7 @@ class TestDeployScripts(unittest.TestCase):
                 )
 
     def test_deploys_before_secret_put(self) -> None:
-        """坑：secret put 要求 Worker 已存在，顺序不能反。"""
+        """坑：secret bulk/put 要求 Worker 已存在，顺序不能反。"""
         for rel in (
             "scripts/keepalive/deploy-keepalive.ps1",
             "scripts/keepalive/deploy-keepalive.sh",
@@ -177,10 +207,18 @@ class TestDeployScripts(unittest.TestCase):
             content = read(rel)
             # 找实际调用，而不是注释里出现的 "secret put" 字样
             deploy_at = content.find("wrangler@latest deploy")
-            secret_at = content.find("wrangler@latest secret put")
+            secret_ats = [
+                i
+                for i in (
+                    content.find("wrangler@latest secret put"),
+                    content.find("wrangler@latest secret bulk"),
+                )
+                if i != -1
+            ]
             self.assertNotEqual(deploy_at, -1, f"{rel}: deploy call missing")
-            self.assertNotEqual(secret_at, -1, f"{rel}: secret put call missing")
-            self.assertLess(deploy_at, secret_at, f"{rel}: must deploy BEFORE secret put")
+            self.assertTrue(secret_ats, f"{rel}: secret write call missing")
+            secret_at = min(secret_ats)
+            self.assertLess(deploy_at, secret_at, f"{rel}: must deploy BEFORE writing secrets")
 
     def test_secret_value_not_inlined(self) -> None:
         """脚本里不能内嵌真实密钥（`ibk_...` 这种格式说明是允许的）。"""
