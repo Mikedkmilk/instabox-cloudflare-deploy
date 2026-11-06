@@ -46,11 +46,13 @@
 | `auto-suspend 0` 无效 | 免费套餐锁死 1800 秒 | 只能用 activity lease |
 | lease 续租 404 `machine not found` | 端点只认机器 ID | 用 `m_xxx`，不用机器名 |
 | lease 续租 409 `machine_not_running` | 机器被挂起 | 先 `resume`（失败用 `start`），等 running 再续租 |
-| lease 续租 409 `machine_cooldown` | 撞 8 小时上限的冷却期 | 读 `retryAfterSeconds`，本轮跳过，**别硬撞** |
+| lease 续租 409 `machine_cooldown` | 撞运行上限的冷却期 | 读 `retryAfterSeconds`，本轮跳过，**别硬撞** |
 | `resume` / `start` 报错 | 缺 Idempotency-Key | 加 `-H "Idempotency-Key: $(uuidgen)"` |
 | Worker deploy 显示 `schedule: */3` 但没触发 | cron 写在了顶层 | wrangler 4 必须写在 `[triggers]` 下 |
-| `secret put` 报 Success 但 secret 是空的 | 管道喂了空值（路径写错） | 用 `/status` 验证，**别信 Success** |
-| `secret put` 报 worker 不存在 | 顺序反了 | 先 `deploy` 再 `secret put` |
+| `secret bulk` 报 Success 但 secret 是空的 | 管道喂了空值（路径写错） | 用 `/status` 验证，**别信 Success** |
+| `secret bulk` 报 worker 不存在 | 顺序反了 | 先 `deploy` 再 `secret bulk` |
+| Worker 一直回 `token 不对` | secret 用管道写入，尾部多了一个换行（wrangler 不 trim） | 改用 `wrangler secret bulk`（JSON 文件） |
+| 机器频繁撞运行上限、`maxRunMinutes` 一直是 120 | 保活只续租没跑 exec，拿不到动态延长 | 确认 Worker 版本含 `realWork`，或设 `INSTABOX_EXEC_CMD` |
 | `wrangler login` 报 `Timed out waiting for authorization code` | OAuth 只有 120 秒窗口 | 改用 `--device` 或 API Token |
 | `wrangler tail` 一直无输出 | `\| Out-String` 聚合了输出 | 重定向到文件：`cmd.exe /c "... > tail.log 2>&1"` |
 | Worker 无重试无告警，失败静默 | 免费版限制 | 定期 `wrangler tail`；或加外部探活 |

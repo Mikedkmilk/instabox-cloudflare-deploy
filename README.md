@@ -427,8 +427,12 @@ Cloudflare 免费版没有中国内地节点。要快只能换国内服务器并
 不行。网关按 Host 头路由，自定义 Host 返回 404，80 端口不通，
 且 InstaBox 证书的 SAN 仅覆盖 `*.instabox.tech`。**必须走 Tunnel。**
 
-**Q：`secret put` 显示 Success 但 secret 是空的？**
+**Q：`secret bulk` 显示 Success 但 secret 是空的？**
 管道喂了空值（路径写错）。用 `/status` 验证，**别信 Success 输出**。
+
+**Q：Worker 一直回 `token 不对`？**
+多半是用管道喂的 secret，尾部多了一个换行而 wrangler 不 trim。
+改用 `wrangler secret bulk`（JSON 文件），见 `scripts/keepalive/deploy-keepalive.ps1`。
 
 **Q：`instabox exec` 的输出怎么是空的？**
 多行 bash 会被吞。改用单行命令，或把复杂逻辑写成脚本文件 push 上去再执行。
@@ -453,7 +457,7 @@ Cloudflare 免费版没有中国内地节点。要快只能换国内服务器并
 | Worker 一直回 `token 不对` | secret 写入时尾部多了一个换行（管道喂值 + wrangler 不 trim） | 改用 `wrangler secret bulk`（见 `scripts/keepalive/deploy-keepalive.ps1`） |
 | 机器频繁撞运行上限、`maxRunMinutes` 一直是 120 | 保活只续租没跑 exec，拿不到动态延长 | 确认 Worker 版本含 `realWork`，或设 `INSTABOX_EXEC_CMD` |
 | Worker deploy 显示 cron 但不触发 | cron 写在了顶层 | 移到 `[triggers]` 下 |
-| `secret put` 报 worker 不存在 | 顺序反了 | 先 `deploy` 再 `secret put` |
+| `secret bulk` 报 worker 不存在 | 顺序反了 | 先 `deploy` 再 `secret bulk` |
 | 构建后全站 500 / 裸文本 | `dev` 与 `start` 共用 `.next` 损坏 | 停服 → `rm -rf .next` → 重新 build |
 | 动态路由 404（Next 15+） | `params`/`searchParams` 变成 Promise | `const params = await props.params` |
 | 表单提交后跳到 localhost | 重定向用了绝对地址 | 用相对 Location |
@@ -559,7 +563,8 @@ python -m unittest discover -s scripts -p "test_*.py" -v
 - `call()` 必须透传 `Idempotency-Key`
 - build 前必须先停 `next start`
 - `instabox exec --timeout` ≤ 600 秒
-- `secret put` 必须在 `deploy` 之后
+- `secret bulk` 必须在 `deploy` 之后
+- secret 用 `wrangler secret bulk` 写，**不要用管道喂 `secret put`**（尾换行会让 Worker 永远回「token 不对」）
 - 文档不得出现真实机器 ID / API Key
 - 文档里引用的每个路径都必须真实存在
 
